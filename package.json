@@ -1,0 +1,24 @@
+{
+  "name": "hfdownloader",
+  "version": "0.1.0",
+  "description": "A self-hosted TUI for installing GGUF Quants from Hugging Face onto a llama Router",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=22.18"
+  },
+  "bin": {
+    "hfdownloader": "./bin/hfdownloader"
+  },
+  "scripts": {
+    "start": "node src/cli.ts",
+    "test": "node --test test/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc",
+    "demo": "node scripts/demo.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.9.0"
+  }
+}

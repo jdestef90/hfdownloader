@@ -1,0 +1,12 @@
+{
+  "mode": "ssh",
+  "routerUrl": "http://127.0.0.1:8080",
+  "sshTarget": "user@router-host",
+  "ggufDirectory": "/path/to/models/gguf",
+  "presetPath": "/path/to/presets.ini",
+  "restartCommand": "brew services restart llama.cpp",
+  "helperModel": "helper-model-id",
+  "hubToken": "",
+  "routerApiKey": "",
+  "helperTimeoutMs": 15000
+}
