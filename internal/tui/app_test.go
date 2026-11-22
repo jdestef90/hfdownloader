@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -332,4 +333,136 @@ func TestHelperModelContextSuggestionAppearsEditableInDraft(t *testing.T) {
 		t.Fatal("expected Preset file not to be written silently")
 	}
 }
+
+func TestSidecarCheckboxesTransferAndWireIntoPreset(t *testing.T) {
+	mainBytes := []byte("main-quant-gguf")
+	mmprojBytes := []byte("mmproj-sidecar-gguf")
+	mtpBytes := []byte("mtp-sidecar-gguf")
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/org/repo/resolve/main/Qwen3-Q8_0.gguf", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(mainBytes)
+	})
+	mux.HandleFunc("/org/repo/resolve/main/mmproj-BF16.gguf", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(mmprojBytes)
+	})
+	mux.HandleFunc("/org/repo/resolve/main/Qwen3-mtp.gguf", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(mtpBytes)
+	})
+
+	// Serve via local hub client backed by an in-memory RoundTripper.
+	dir := t.TempDir()
+	ggufDir := filepath.Join(dir, "gguf")
+	presetPath := filepath.Join(dir, "presets.ini")
+
+	info := hub.RepoInfo{
+		Repo:     "org/repo",
+		Revision: "main",
+		Sidecars: []hub.Sidecar{
+			{Path: "mmproj-BF16.gguf", Size: int64(len(mmprojBytes)), Kind: hub.SidecarMMProj},
+			{Path: "Qwen3-mtp.gguf", Size: int64(len(mtpBytes)), Kind: hub.SidecarMTP},
+		},
+		Quants: []hub.Quant{
+			{
+				Label:         "Q8_0",
+				Size:          int64(len(mainBytes)),
+				ContextLength: 32768,
+				Files:         []hub.File{{Path: "Qwen3-Q8_0.gguf", Size: int64(len(mainBytes))}},
+			},
+		},
+	}
+
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	hubSvc := &localTestHub{info: info, baseURL: srv.URL}
+
+	cfg := sampleConfig()
+	cfg.Mode = config.ModeLocal
+	cfg.GGUFDirectory = ggufDir
+	cfg.PresetPath = presetPath
+
+	m := New(Options{
+		Config:     cfg,
+		Hub:        hubSvc,
+		Target:     transfer.NewLocalTarget(),
+		Router:     &fakeRouter{visible: true},
+		HTTPClient: srv.Client(),
+	})
+	updated, _ := m.Update(repoLoadedMsg{info: info})
+	picker := updated.(Model)
+
+	if !strings.Contains(picker.View(), "[ ] [mmproj] mmproj-BF16.gguf") || !strings.Contains(picker.View(), "[ ] [mtp] Qwen3-mtp.gguf") {
+		t.Fatalf("expected optional Sidecar checkboxes in picker view, got:\n%s", picker.View())
+	}
+
+	// Tab to Sidecars, check mmproj, move down, check mtp, Tab back to Quants.
+	updated, _ = picker.Update(tea.KeyMsg{Type: tea.KeyTab})
+	updated, _ = updated.(Model).Update(tea.KeyMsg{Type: tea.KeySpace, Runes: []rune{' '}})
+	updated, _ = updated.(Model).Update(tea.KeyMsg{Type: tea.KeyDown})
+	updated, _ = updated.(Model).Update(tea.KeyMsg{Type: tea.KeySpace, Runes: []rune{' '}})
+	updated, _ = updated.(Model).Update(tea.KeyMsg{Type: tea.KeyTab})
+	picker = updated.(Model)
+
+	if !strings.Contains(picker.View(), "[x]") {
+		t.Fatalf("expected checked Sidecar boxes in picker view, got:\n%s", picker.View())
+	}
+
+	// Press Enter on Quant to download main Quant + both checked Sidecars.
+	updated, _ = picker.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	downloading := updated.(Model)
+	if downloading.screen != screenDownloading {
+		t.Fatalf("expected screenDownloading, got %v", downloading.screen)
+	}
+	doneMsg := <-downloading.dlSession.doneCh
+	updated, _ = downloading.Update(doneMsg)
+	prep := updated.(Model)
+	if prep.screen != screenPreparingPreset {
+		t.Fatalf("expected screenPreparingPreset after download, got %v (err=%q)", prep.screen, prep.errMsg)
+	}
+
+	// Verify all three files landed in GGUF Directory.
+	for _, name := range []string{"Qwen3-Q8_0.gguf", "mmproj-BF16.gguf", "Qwen3-mtp.gguf"} {
+		if _, err := os.Stat(filepath.Join(ggufDir, name)); err != nil {
+			t.Fatalf("expected %s to be transferred into GGUF Directory: %v", name, err)
+		}
+	}
+
+	// Prepare Preset and verify Sidecar references in rendered & written Preset.
+	prepMsg := prep.preparePresetCmd()()
+	updated, _ = prep.Update(prepMsg)
+	ed := updated.(Model)
+	d, raw, err := ed.editor.buildForSave()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"mmproj = " + filepath.Join(ggufDir, "mmproj-BF16.gguf"),
+		"model-draft = " + filepath.Join(ggufDir, "Qwen3-mtp.gguf"),
+		"spec-type = draft-mtp",
+	} {
+		if !strings.Contains(raw, want) {
+			t.Errorf("expected Preset INI to contain %q, got:\n%s", want, raw)
+		}
+	}
+	writeMsg := ed.writePresetCmd(d, raw, false)()
+	updated, _ = ed.Update(writeMsg)
+	if updated.(Model).screen != screenPresetWritten {
+		t.Fatalf("expected screenPresetWritten, got %v", updated.(Model).screen)
+	}
+}
+
+type localTestHub struct {
+	info    hub.RepoInfo
+	baseURL string
+}
+
+func (h *localTestHub) ListQuants(_ context.Context, _, _ string) (hub.RepoInfo, error) {
+	return h.info, nil
+}
+func (h *localTestHub) ResolveURL(repo, filePath, revision string) string {
+	return h.baseURL + "/" + repo + "/resolve/" + revision + "/" + filePath
+}
+func (h *localTestHub) AuthHeaders() http.Header { return make(http.Header) }
+
 

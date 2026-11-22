@@ -114,10 +114,14 @@ type Model struct {
 	spin     spinner.Model
 	progBar  progress.Model
 
-	repo           hub.RepoInfo
-	cursor         int
-	selectedQuant  hub.Quant
-	overwritePaths []string
+	repo            hub.RepoInfo
+	cursor          int
+	sidecarFocus    bool
+	sidecarCursor   int
+	checkedSidecars map[int]bool
+	selectedQuant   hub.Quant
+	chosenSidecars  []hub.Sidecar
+	overwritePaths  []string
 
 	dlSession  *downloadSession
 	dlProgress transfer.Progress
@@ -200,13 +204,25 @@ func waitDownloadEvent(sess *downloadSession) tea.Cmd {
 	}
 }
 
-func (m *Model) startDownload(quant hub.Quant, overwrite bool) tea.Cmd {
+func (m *Model) checkedSidecarList() []hub.Sidecar {
+	var out []hub.Sidecar
+	for i, sc := range m.repo.Sidecars {
+		if m.checkedSidecars[i] {
+			out = append(out, sc)
+		}
+	}
+	return out
+}
+
+func (m *Model) startDownload(quant hub.Quant, sidecars []hub.Sidecar, overwrite bool) tea.Cmd {
 	m.selectedQuant = quant
+	m.chosenSidecars = append([]hub.Sidecar(nil), sidecars...)
 	m.errMsg = ""
 	m.status = ""
 	m.overwritePaths = nil
 
-	files := make([]transfer.DownloadFile, 0, len(quant.Files))
+	files := make([]transfer.DownloadFile, 0, len(quant.Files)+len(sidecars))
+	totalSize := quant.Size
 	for _, f := range quant.Files {
 		files = append(files, transfer.DownloadFile{
 			Path:   f.Path,
@@ -214,6 +230,15 @@ func (m *Model) startDownload(quant hub.Quant, overwrite bool) tea.Cmd {
 			SHA256: f.SHA256,
 			URL:    m.hub.ResolveURL(m.repo.Repo, f.Path, m.repo.Revision),
 		})
+	}
+	for _, sc := range sidecars {
+		files = append(files, transfer.DownloadFile{
+			Path:   sc.Path,
+			Size:   sc.Size,
+			SHA256: sc.SHA256,
+			URL:    m.hub.ResolveURL(m.repo.Repo, sc.Path, m.repo.Revision),
+		})
+		totalSize += sc.Size
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -225,7 +250,7 @@ func (m *Model) startDownload(quant hub.Quant, overwrite bool) tea.Cmd {
 	m.dlSession = sess
 	m.dlProgress = transfer.Progress{
 		File:       path.Base(files[0].Path),
-		Total:      quant.Size,
+		Total:      totalSize,
 		TotalFiles: len(files),
 		ETASeconds: math.Inf(1),
 	}
@@ -269,6 +294,7 @@ func (m Model) preparePresetCmd() tea.Cmd {
 	cfg := m.cfg
 	repo := m.repo.Repo
 	quant := m.selectedQuant
+	sidecars := append([]hub.Sidecar(nil), m.chosenSidecars...)
 	dlRes := m.dlResult
 
 	return func() tea.Msg {
@@ -284,6 +310,17 @@ func (m Model) preparePresetCmd() tea.Cmd {
 		modelPath := ""
 		if len(dlRes.Files) > 0 {
 			modelPath = dlRes.Files[0].Path
+		}
+
+		var mmprojPath, mtpPath string
+		for _, sc := range sidecars {
+			dest := transfer.JoinTargetPath(cfg.GGUFDirectory, path.Base(sc.Path))
+			switch sc.Kind {
+			case hub.SidecarMMProj:
+				mmprojPath = dest
+			case hub.SidecarMTP:
+				mtpPath = dest
+			}
 		}
 
 		var ctxWin *int
@@ -314,6 +351,8 @@ func (m Model) preparePresetCmd() tea.Cmd {
 			QuantLabel:         quant.Label,
 			ModelPath:          modelPath,
 			ContextWindow:      ctxWin,
+			MMProjPath:         mmprojPath,
+			MTPPath:            mtpPath,
 			ExistingPresetText: existingText,
 		})
 		if err != nil {
@@ -405,6 +444,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.status = ""
 		m.repo = msg.info
 		m.cursor = 0
+		m.sidecarFocus = false
+		m.sidecarCursor = 0
+		m.checkedSidecars = make(map[int]bool)
 		m.screen = screenPicker
 		return m, nil
 
@@ -545,21 +587,63 @@ func (m Model) updateURLInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
+func (m *Model) toggleSidecar(idx int) {
+	if idx < 0 || idx >= len(m.repo.Sidecars) {
+		return
+	}
+	if m.checkedSidecars == nil {
+		m.checkedSidecars = make(map[int]bool)
+	}
+	if m.checkedSidecars[idx] {
+		delete(m.checkedSidecars, idx)
+		return
+	}
+	// Ensure at most one Sidecar of each kind (mmproj / mtp) is selected at a time.
+	kind := m.repo.Sidecars[idx].Kind
+	for otherIdx, sc := range m.repo.Sidecars {
+		if sc.Kind == kind {
+			delete(m.checkedSidecars, otherIdx)
+		}
+	}
+	m.checkedSidecars[idx] = true
+}
+
 func (m Model) updatePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "q", "esc":
 		return m, tea.Quit
+	case "tab":
+		if len(m.repo.Sidecars) > 0 {
+			m.sidecarFocus = !m.sidecarFocus
+		}
 	case "up", "k":
-		if m.cursor > 0 {
+		m.status = ""
+		m.errMsg = ""
+		if m.sidecarFocus {
+			if m.sidecarCursor > 0 {
+				m.sidecarCursor--
+			} else {
+				m.sidecarFocus = false
+			}
+		} else if m.cursor > 0 {
 			m.cursor--
-			m.status = ""
-			m.errMsg = ""
 		}
 	case "down", "j":
-		if m.cursor < len(m.repo.Quants)-1 {
+		m.status = ""
+		m.errMsg = ""
+		if m.sidecarFocus {
+			if m.sidecarCursor < len(m.repo.Sidecars)-1 {
+				m.sidecarCursor++
+			}
+		} else if m.cursor < len(m.repo.Quants)-1 {
 			m.cursor++
-			m.status = ""
-			m.errMsg = ""
+		} else if len(m.repo.Sidecars) > 0 {
+			m.sidecarFocus = true
+			m.sidecarCursor = 0
+		}
+	case " ":
+		if m.sidecarFocus && len(m.repo.Sidecars) > 0 {
+			m.toggleSidecar(m.sidecarCursor)
 		}
 	case "u":
 		m.screen = screenURLInput
@@ -568,13 +652,18 @@ func (m Model) updatePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.urlInput.Focus()
 		return m, textinput.Blink
 	case "enter":
+		if m.sidecarFocus && len(m.repo.Sidecars) > 0 {
+			m.toggleSidecar(m.sidecarCursor)
+			return m, nil
+		}
 		if m.cursor >= 0 && m.cursor < len(m.repo.Quants) {
 			q := m.repo.Quants[m.cursor]
+			sidecars := m.checkedSidecarList()
 			if m.target == nil {
 				m.status = fmt.Sprintf("Selected Quant %s (%s, %d file(s)) — read-only browse mode.", q.Label, hub.FormatBytes(q.Size), len(q.Files))
 				return m, nil
 			}
-			cmd := m.startDownload(q, false)
+			cmd := m.startDownload(q, sidecars, false)
 			return m, cmd
 		}
 	}
@@ -584,7 +673,7 @@ func (m Model) updatePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m Model) updateOverwriteConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch strings.ToLower(msg.String()) {
 	case "y":
-		cmd := m.startDownload(m.selectedQuant, true)
+		cmd := m.startDownload(m.selectedQuant, m.chosenSidecars, true)
 		return m, cmd
 	case "n", "esc":
 		m.overwritePaths = nil
@@ -772,8 +861,11 @@ func (m Model) View() string {
 
 		for i, q := range m.repo.Quants {
 			cursor := "  "
-			if i == m.cursor {
+			activeRow := !m.sidecarFocus && i == m.cursor
+			if activeRow {
 				cursor = styleSelected.Render("▸ ")
+			} else if i == m.cursor {
+				cursor = styleMuted.Render("• ")
 			}
 
 			shardBadge := ""
@@ -786,7 +878,7 @@ func (m Model) View() string {
 			}
 
 			b.WriteString(cursor)
-			if i == m.cursor {
+			if activeRow {
 				b.WriteString(styleSelected.Render(fmt.Sprintf("%-14s %10s", q.Label, hub.FormatBytes(q.Size))))
 			} else {
 				b.WriteString(fmt.Sprintf("%-14s %10s", q.Label, hub.FormatBytes(q.Size)))
@@ -799,10 +891,19 @@ func (m Model) View() string {
 
 		if len(m.repo.Sidecars) > 0 {
 			b.WriteString("\n")
-			b.WriteString(styleWarning.Render(fmt.Sprintf("Detected Sidecars (%d):", len(m.repo.Sidecars))))
+			b.WriteString(styleWarning.Render(fmt.Sprintf("Optional Sidecars (%d) — Tab / Space to toggle:", len(m.repo.Sidecars))))
 			b.WriteString("\n")
-			for _, sc := range m.repo.Sidecars {
-				b.WriteString(fmt.Sprintf("  [%s] %s (%s)\n", sc.Kind, path.Base(sc.Path), hub.FormatBytes(sc.Size)))
+			for i, sc := range m.repo.Sidecars {
+				cursor := "  "
+				if m.sidecarFocus && i == m.sidecarCursor {
+					cursor = styleSelected.Render("▸ ")
+				}
+				box := "[ ]"
+				if m.checkedSidecars[i] {
+					box = styleSuccess.Render("[x]")
+				}
+				line := fmt.Sprintf("%s %s [%s] %s (%s)", cursor, box, sc.Kind, path.Base(sc.Path), hub.FormatBytes(sc.Size))
+				b.WriteString(line + "\n")
 			}
 		}
 
@@ -818,7 +919,11 @@ func (m Model) View() string {
 		}
 
 		b.WriteString("\n")
-		b.WriteString(styleMuted.Render("↑/↓ or j/k: move  •  Enter: download Quant  •  u: change URL  •  q: quit"))
+		helpLine := "↑/↓ or j/k: move  •  Enter: download Quant  •  u: change URL  •  q: quit"
+		if len(m.repo.Sidecars) > 0 {
+			helpLine = "↑/↓: move  •  Tab: Sidecars  •  Space: toggle Sidecar  •  Enter: download  •  u: URL  •  q: quit"
+		}
+		b.WriteString(styleMuted.Render(helpLine))
 		b.WriteString("\n")
 
 	case screenOverwriteConfirm:
@@ -889,6 +994,17 @@ func (m Model) View() string {
 				ctxLabel += " (" + m.editor.ctxSourceLabel + ")"
 			}
 			b.WriteString(renderField(ctxLabel, m.editor.ctxInput.View(), m.editor.activeField == fieldContextWindow))
+			if m.editor.draft.MMProjPath != "" || m.editor.draft.MTPPath != "" {
+				b.WriteString("\n")
+				b.WriteString(styleMuted.Render("Wired Sidecars:"))
+				b.WriteString("\n")
+				if m.editor.draft.MMProjPath != "" {
+					b.WriteString(fmt.Sprintf("  mmproj = %s\n", m.editor.draft.MMProjPath))
+				}
+				if m.editor.draft.MTPPath != "" {
+					b.WriteString(fmt.Sprintf("  model-draft = %s\n  spec-type = draft-mtp\n", m.editor.draft.MTPPath))
+				}
+			}
 			if len(m.editor.draft.Defaults) > 0 {
 				src := "copied defaults"
 				if m.editor.copiedFrom != "" {
