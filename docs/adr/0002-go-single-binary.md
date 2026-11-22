@@ -1,0 +1,3 @@
+# Single Go binary with Bubble Tea TUI
+
+HF Downloader is built as a single statically-linked Go binary using Bubble Tea, Lip Gloss, and Bubbles for its terminal UI. We pivoted away from the initial Node.js/TypeScript prototype (preserved at git tag `ts-prototype`) because running the tool directly on the Router host in `local` mode requires copying one small, self-contained executable with zero runtime dependencies rather than installing Node.js 22+ alongside a source tree or bundling a ~50–100 MB JS runtime. Go's standard library covers Hub HTTP requests, streaming multi-GB Quant transfers, SHA-256 verification, and shelling out to `ssh` (preserving `~/.ssh/config` and agent support), while Bubble Tea compiles a responsive TUI directly into the same binary.

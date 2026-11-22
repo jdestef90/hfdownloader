@@ -1,6 +1,8 @@
-node_modules/
-dist/
-coverage/
+/hfdownloader
+/bin/
+/dist/
+*.out
+coverage.*
 *.log
 .env
 .env.*
