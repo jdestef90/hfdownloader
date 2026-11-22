@@ -22,6 +22,7 @@ const (
 )
 
 type presetEditor struct {
+	initialized bool
 	draft       preset.Draft
 	rawMode     bool
 	activeField presetField
@@ -69,6 +70,7 @@ func newPresetEditor(draft preset.Draft, existingText string, ctxSourceLabel str
 	}
 
 	return presetEditor{
+		initialized:    true,
 		draft:          draft,
 		activeField:    fieldAlias,
 		aliasInput:     aliasIn,
@@ -82,6 +84,9 @@ func newPresetEditor(draft preset.Draft, existingText string, ctxSourceLabel str
 }
 
 func (e *presetEditor) setWidth(totalWidth int) {
+	if !e.initialized {
+		return
+	}
 	w := totalWidth - 16
 	if w > 76 {
 		w = 76

@@ -465,4 +465,18 @@ func (h *localTestHub) ResolveURL(repo, filePath, revision string) string {
 }
 func (h *localTestHub) AuthHeaders() http.Header { return make(http.Header) }
 
+func TestWindowSizeMsgBeforeEditorInitDoesNotPanic(t *testing.T) {
+	m := New(Options{
+		Config:     sampleConfig(),
+		Hub:        &fakeHub{info: sampleRepoInfo()},
+		InitialURL: "https://huggingface.co/unsloth/Qwen3-GGUF",
+	})
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	got := updated.(Model)
+	if got.width != 120 || got.height != 40 {
+		t.Fatalf("expected recorded terminal size 120x40, got %dx%d", got.width, got.height)
+	}
+}
+
+
 

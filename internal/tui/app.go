@@ -630,6 +630,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
+	default:
+		switch m.screen {
+		case screenURLInput:
+			var cmd tea.Cmd
+			m.urlInput, cmd = m.urlInput.Update(msg)
+			return m, cmd
+		case screenPresetEditor:
+			return m, m.editor.updateInput(msg)
+		}
 	}
 
 	return m, nil
