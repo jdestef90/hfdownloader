@@ -14,6 +14,7 @@ import (
 	"github.com/jdestef90/hfdownloader/internal/config"
 	"github.com/jdestef90/hfdownloader/internal/hub"
 	"github.com/jdestef90/hfdownloader/internal/preset"
+	"github.com/jdestef90/hfdownloader/internal/router"
 	"github.com/jdestef90/hfdownloader/internal/transfer"
 )
 
@@ -40,8 +41,20 @@ func (f *fakeHub) AuthHeaders() http.Header {
 }
 
 type fakeRouter struct {
-	visible bool
-	waited  []string
+	visible    bool
+	waited     []string
+	suggestion *router.ContextSuggestion
+}
+
+func (f *fakeRouter) SuggestContextWindow(_ context.Context, in router.ContextSuggestionInput) router.ContextSuggestion {
+	if f.suggestion != nil {
+		return *f.suggestion
+	}
+	if in.Fallback > 0 {
+		v := in.Fallback
+		return router.ContextSuggestion{Value: &v, Source: router.SourceHub}
+	}
+	return router.ContextSuggestion{Source: router.SourceNone}
 }
 
 func (f *fakeRouter) WaitForPreset(_ context.Context, alias string, _, _ time.Duration) bool {
@@ -276,3 +289,47 @@ func TestPresetEditorStructuredRawSyncCopyDefaultsAndWrite(t *testing.T) {
 		t.Fatalf("expected screenPresetOverwriteConfirm on duplicate alias, got %v", ow.screen)
 	}
 }
+
+func TestHelperModelContextSuggestionAppearsEditableInDraft(t *testing.T) {
+	dir := t.TempDir()
+	presetPath := filepath.Join(dir, "presets.ini")
+	cfg := sampleConfig()
+	cfg.Mode = config.ModeLocal
+	cfg.PresetPath = presetPath
+
+	suggested := 24576
+	rtr := &fakeRouter{
+		visible:    true,
+		suggestion: &router.ContextSuggestion{Value: &suggested, Source: router.SourceHelper},
+	}
+
+	m := New(Options{
+		Config: cfg,
+		Hub:    &fakeHub{info: sampleRepoInfo()},
+		Target: transfer.NewLocalTarget(),
+		Router: rtr,
+	})
+	m.repo = sampleRepoInfo()
+	m.selectedQuant = m.repo.Quants[0]
+	m.dlResult = transfer.DownloadResult{
+		Files: []transfer.DownloadedFile{{Path: "/srv/gguf/Qwen3-Q4_K_M-00001-of-00002.gguf", Size: 100}},
+	}
+
+	prepMsg := m.preparePresetCmd()()
+	updated, _ := m.Update(prepMsg)
+	ed := updated.(Model)
+	if ed.screen != screenPresetEditor {
+		t.Fatalf("expected Preset editor (not silently written), got screen %v", ed.screen)
+	}
+	if ed.editor.ctxInput.Value() != "24576" {
+		t.Fatalf("expected editable prefill 24576, got %q", ed.editor.ctxInput.Value())
+	}
+	if !strings.Contains(ed.View(), "Helper Model") {
+		t.Fatalf("expected Helper Model provenance in view, got:\n%s", ed.View())
+	}
+	// Preset file must not exist yet (never written silently).
+	if _, err := os.Stat(presetPath); !os.IsNotExist(err) {
+		t.Fatal("expected Preset file not to be written silently")
+	}
+}
+

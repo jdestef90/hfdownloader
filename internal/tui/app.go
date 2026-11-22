@@ -18,6 +18,7 @@ import (
 	"github.com/jdestef90/hfdownloader/internal/config"
 	"github.com/jdestef90/hfdownloader/internal/hub"
 	"github.com/jdestef90/hfdownloader/internal/preset"
+	"github.com/jdestef90/hfdownloader/internal/router"
 	"github.com/jdestef90/hfdownloader/internal/transfer"
 )
 
@@ -30,6 +31,7 @@ type HubService interface {
 
 // RouterService abstracts Router HTTP operations needed by the TUI.
 type RouterService interface {
+	SuggestContextWindow(ctx context.Context, in router.ContextSuggestionInput) router.ContextSuggestion
 	WaitForPreset(ctx context.Context, alias string, timeout, interval time.Duration) bool
 }
 
@@ -263,7 +265,8 @@ func (m *Model) startDownload(quant hub.Quant, overwrite bool) tea.Cmd {
 
 func (m Model) preparePresetCmd() tea.Cmd {
 	target := m.target
-	presetPath := m.cfg.PresetPath
+	rtr := m.router
+	cfg := m.cfg
 	repo := m.repo.Repo
 	quant := m.selectedQuant
 	dlRes := m.dlResult
@@ -271,7 +274,7 @@ func (m Model) preparePresetCmd() tea.Cmd {
 	return func() tea.Msg {
 		var existingText string
 		if target != nil {
-			txt, _, err := target.ReadText(context.Background(), presetPath)
+			txt, _, err := target.ReadText(context.Background(), cfg.PresetPath)
 			if err != nil {
 				return presetPreparedMsg{err: err}
 			}
@@ -285,7 +288,22 @@ func (m Model) preparePresetCmd() tea.Cmd {
 
 		var ctxWin *int
 		ctxLabel := ""
-		if quant.ContextLength > 0 {
+		if rtr != nil {
+			suggestion := rtr.SuggestContextWindow(context.Background(), router.ContextSuggestionInput{
+				Repo:        repo,
+				Quant:       quant,
+				HelperModel: cfg.HelperModel,
+				Fallback:    quant.ContextLength,
+				Timeout:     time.Duration(cfg.HelperTimeoutMs) * time.Millisecond,
+			})
+			ctxWin = suggestion.Value
+			switch suggestion.Source {
+			case router.SourceHelper:
+				ctxLabel = "suggested by Helper Model: " + cfg.HelperModel
+			case router.SourceHub:
+				ctxLabel = "Hub context limit fallback"
+			}
+		} else if quant.ContextLength > 0 {
 			v := quant.ContextLength
 			ctxWin = &v
 			ctxLabel = "Hub metadata"

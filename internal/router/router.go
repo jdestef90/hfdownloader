@@ -1,12 +1,18 @@
 package router
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/jdestef90/hfdownloader/internal/hub"
 )
 
 // PresetInfo represents a Preset entry returned by the Router's /v1/models endpoint.
@@ -14,6 +20,30 @@ type PresetInfo struct {
 	ID            string
 	Preset        string
 	ContextLength int
+}
+
+// SuggestionSource identifies where a Context Window prefill came from.
+type SuggestionSource string
+
+const (
+	SourceHelper SuggestionSource = "helper"
+	SourceHub    SuggestionSource = "hub"
+	SourceNone   SuggestionSource = "none"
+)
+
+// ContextSuggestion holds an editable Context Window prefill and its provenance.
+type ContextSuggestion struct {
+	Value  *int
+	Source SuggestionSource
+}
+
+// ContextSuggestionInput supplies Quant Hub metadata for the Helper Model prompt.
+type ContextSuggestionInput struct {
+	Repo        string
+	Quant       hub.Quant
+	HelperModel string
+	Fallback    int
+	Timeout     time.Duration
 }
 
 // ClientOptions configures a llama.cpp Router HTTP client.
@@ -41,6 +71,134 @@ func NewClient(opts ClientOptions) *Client {
 		APIKey:     strings.TrimSpace(opts.APIKey),
 		httpClient: httpClient,
 	}
+}
+
+var (
+	thousandsRe = regexp.MustCompile(`(?i)(\d+(?:\.\d+)?)\s*k\b`)
+	digitsRe    = regexp.MustCompile(`\d+`)
+)
+
+func parseSuggestedContext(content string) (int, bool) {
+	normalized := strings.ReplaceAll(content, ",", "")
+	if m := thousandsRe.FindStringSubmatch(normalized); len(m) == 2 {
+		if f, err := strconv.ParseFloat(m[1], 64); err == nil {
+			v := int(math.Round(f * 1024))
+			if v > 0 && v <= 10_000_000 {
+				return v, true
+			}
+		}
+	}
+	for _, token := range digitsRe.FindAllString(normalized, -1) {
+		v, err := strconv.Atoi(token)
+		if err == nil && v > 0 && v <= 10_000_000 {
+			return v, true
+		}
+	}
+	return 0, false
+}
+
+func buildContextPrompt(in ContextSuggestionInput) string {
+	fileDescs := make([]string, 0, len(in.Quant.Files))
+	for _, f := range in.Quant.Files {
+		fileDescs = append(fileDescs, fmt.Sprintf("%s (%d bytes)", f.Path, f.Size))
+	}
+	arch := in.Quant.Architecture
+	if arch == "" {
+		arch = "unknown"
+	}
+	ctxLimit := "unknown"
+	if in.Quant.ContextLength > 0 {
+		ctxLimit = fmt.Sprintf("%d tokens", in.Quant.ContextLength)
+	}
+	return strings.Join([]string{
+		"Choose a safe llama.cpp Context Window for this GGUF Quant.",
+		"Repository: " + in.Repo,
+		"Quant: " + in.Quant.Label,
+		"Architecture: " + arch,
+		"Published Hub context limit: " + ctxLimit,
+		"Files: " + strings.Join(fileDescs, ", "),
+		"Reply with one integer number of tokens and no other text.",
+	}, "\n")
+}
+
+// SuggestContextWindow asks the configured Helper Model via /v1/chat/completions for a
+// Context Window suggestion, falling back to the published Hub context limit on timeout or unusable output.
+func (c *Client) SuggestContextWindow(ctx context.Context, in ContextSuggestionInput) ContextSuggestion {
+	fallback := ContextSuggestion{Source: SourceNone}
+	if in.Fallback > 0 {
+		v := in.Fallback
+		fallback = ContextSuggestion{Value: &v, Source: SourceHub}
+	}
+	if strings.TrimSpace(in.HelperModel) == "" {
+		return fallback
+	}
+
+	timeout := in.Timeout
+	if timeout <= 0 {
+		timeout = 15 * time.Second
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	reqBody := map[string]any{
+		"model": in.HelperModel,
+		"messages": []map[string]string{
+			{
+				"role":    "system",
+				"content": "You size Context Windows for llama.cpp Presets. Reply with a single integer number of tokens.",
+			},
+			{
+				"role":    "user",
+				"content": buildContextPrompt(in),
+			},
+		},
+		"temperature": 0,
+		"max_tokens":  32,
+		"stream":      false,
+	}
+	bodyBytes, err := json.Marshal(reqBody)
+	if err != nil {
+		return fallback
+	}
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, c.BaseURL+"/v1/chat/completions", bytes.NewReader(bodyBytes))
+	if err != nil {
+		return fallback
+	}
+	c.applyHeaders(req)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fallback
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fallback
+	}
+
+	var payload struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+			Text string `json:"text"`
+		} `json:"choices"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return fallback
+	}
+	if len(payload.Choices) == 0 {
+		return fallback
+	}
+	content := payload.Choices[0].Message.Content
+	if content == "" {
+		content = payload.Choices[0].Text
+	}
+	if value, ok := parseSuggestedContext(content); ok {
+		return ContextSuggestion{Value: &value, Source: SourceHelper}
+	}
+	return fallback
 }
 
 // ListPresets fetches /v1/models from the Router without loading any model.
