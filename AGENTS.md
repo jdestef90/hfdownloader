@@ -2,7 +2,7 @@
 
 ### Issue tracker
 
-Issues and specs live as local markdown files under `.scratch/`. See `docs/agents/issue-tracker.md`.
+Issues and specs live as GitHub issues in `jdestef90/hfdownloader`. See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 
