@@ -7,37 +7,13 @@ import (
 	"os"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+
+	"github.com/jdestef90/hfdownloader/internal/config"
+	"github.com/jdestef90/hfdownloader/internal/hub"
+	"github.com/jdestef90/hfdownloader/internal/tui"
 )
 
-const version = "0.1.0-dev"
-
-type appModel struct {
-	hubURL string
-}
-
-func (m appModel) Init() tea.Cmd { return nil }
-
-func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	switch msg := msg.(type) {
-	case tea.KeyMsg:
-		switch msg.String() {
-		case "q", "ctrl+c":
-			return m, tea.Quit
-		}
-	}
-	return m, nil
-}
-
-func (m appModel) View() string {
-	title := lipgloss.NewStyle().Bold(true).Render("HF Downloader")
-	body := "Go + Bubble Tea scaffold ready for implementation."
-	if m.hubURL != "" {
-		body = fmt.Sprintf("Hub URL: %s", m.hubURL)
-	}
-	help := lipgloss.NewStyle().Faint(true).Render("Press q to quit.")
-	return fmt.Sprintf("%s\n\n%s\n\n%s\n", title, body, help)
-}
+const version = "0.1.0"
 
 func run(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("hfdownloader", flag.ContinueOnError)
@@ -68,14 +44,32 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 
-	var hubURL string
-	if fs.NArg() > 0 {
-		hubURL = fs.Arg(0)
+	cfg, err := config.Load(config.LoadOptions{
+		ConfigPath:   configPath,
+		ModeOverride: mode,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "hfdownloader: %v\n", err)
+		return 1
 	}
-	_ = configPath
-	_ = mode
 
-	p := tea.NewProgram(appModel{hubURL: hubURL}, tea.WithAltScreen())
+	var initialURL string
+	if fs.NArg() > 0 {
+		initialURL = fs.Arg(0)
+	}
+
+	hubClient := hub.NewClient(hub.ClientOptions{
+		BaseURL: os.Getenv("HFDOWNLOADER_HUB_URL"),
+		Token:   cfg.HubToken,
+	})
+
+	model := tui.New(tui.Options{
+		Config:     cfg,
+		Hub:        hubClient,
+		InitialURL: initialURL,
+	})
+
+	p := tea.NewProgram(model, tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(stderr, "hfdownloader: %v\n", err)
 		return 1

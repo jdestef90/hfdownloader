@@ -2,10 +2,9 @@ package main
 
 import (
 	"bytes"
+	"path/filepath"
 	"strings"
 	"testing"
-
-	tea "github.com/charmbracelet/bubbletea"
 )
 
 func TestRunVersion(t *testing.T) {
@@ -19,16 +18,25 @@ func TestRunVersion(t *testing.T) {
 	}
 }
 
-func TestAppModelQuitsOnQ(t *testing.T) {
-	m := appModel{hubURL: "https://huggingface.co/unsloth/Qwen3-0.6B-GGUF"}
-	if !strings.Contains(m.View(), m.hubURL) {
-		t.Fatalf("expected view to contain Hub URL, got %q", m.View())
+func TestRunHelp(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--help"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("expected exit code 0 for --help, got %d", code)
 	}
-	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
-	if cmd == nil {
-		t.Fatal("expected tea.Quit command on q")
+	if !strings.Contains(stderr.String(), "Usage: hfdownloader") {
+		t.Fatalf("expected usage message, got %q", stderr.String())
 	}
-	if _, ok := cmd().(tea.QuitMsg); !ok {
-		t.Fatalf("expected tea.QuitMsg, got %T", cmd())
+}
+
+func TestRunMissingConfigReturnsError(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	missing := filepath.Join(t.TempDir(), "missing.json")
+	code := run([]string{"--config", missing}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("expected exit code 1 for missing config, got %d", code)
+	}
+	if !strings.Contains(stderr.String(), "cannot read config file") {
+		t.Fatalf("expected config error message, got %q", stderr.String())
 	}
 }
