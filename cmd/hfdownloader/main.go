@@ -64,10 +64,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		Token:   cfg.HubToken,
 	})
 
-	var target transfer.Target
-	if cfg.Mode == config.ModeSSH {
-		target = transfer.NewSSHTarget(cfg.SSHTarget, os.Getenv("HFDOWNLOADER_SSH_BIN"))
-	}
+	target := buildTarget(cfg, os.Getenv("HFDOWNLOADER_SSH_BIN"))
 
 	model := tui.New(tui.Options{
 		Config:     cfg,
@@ -82,6 +79,13 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	return 0
+}
+
+func buildTarget(cfg config.Config, sshBin string) transfer.Target {
+	if cfg.Mode == config.ModeLocal {
+		return transfer.NewLocalTarget()
+	}
+	return transfer.NewSSHTarget(cfg.SSHTarget, sshBin)
 }
 
 func main() {

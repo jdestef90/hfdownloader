@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/jdestef90/hfdownloader/internal/config"
 )
 
 func TestRunVersion(t *testing.T) {
@@ -38,5 +40,16 @@ func TestRunMissingConfigReturnsError(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "cannot read config file") {
 		t.Fatalf("expected config error message, got %q", stderr.String())
+	}
+}
+
+func TestBuildTargetSelectsLocalOrSSH(t *testing.T) {
+	localTarget := buildTarget(config.Config{Mode: config.ModeLocal}, "")
+	if localTarget.Description() != "local" {
+		t.Fatalf("expected local target, got %q", localTarget.Description())
+	}
+	sshTarget := buildTarget(config.Config{Mode: config.ModeSSH, SSHTarget: "justin@router"}, "")
+	if sshTarget.Description() != "ssh justin@router" {
+		t.Fatalf("expected ssh target, got %q", sshTarget.Description())
 	}
 }
