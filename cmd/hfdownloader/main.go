@@ -10,6 +10,7 @@ import (
 
 	"github.com/jdestef90/hfdownloader/internal/config"
 	"github.com/jdestef90/hfdownloader/internal/hub"
+	"github.com/jdestef90/hfdownloader/internal/router"
 	"github.com/jdestef90/hfdownloader/internal/transfer"
 	"github.com/jdestef90/hfdownloader/internal/tui"
 )
@@ -63,13 +64,17 @@ func run(args []string, stdout, stderr io.Writer) int {
 		BaseURL: os.Getenv("HFDOWNLOADER_HUB_URL"),
 		Token:   cfg.HubToken,
 	})
-
+	routerClient := router.NewClient(router.ClientOptions{
+		BaseURL: cfg.RouterURL,
+		APIKey:  cfg.RouterAPIKey,
+	})
 	target := buildTarget(cfg, os.Getenv("HFDOWNLOADER_SSH_BIN"))
 
 	model := tui.New(tui.Options{
 		Config:     cfg,
 		Hub:        hubClient,
 		Target:     target,
+		Router:     routerClient,
 		InitialURL: initialURL,
 	})
 

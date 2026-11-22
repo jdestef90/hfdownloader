@@ -17,6 +17,7 @@ import (
 
 	"github.com/jdestef90/hfdownloader/internal/config"
 	"github.com/jdestef90/hfdownloader/internal/hub"
+	"github.com/jdestef90/hfdownloader/internal/preset"
 	"github.com/jdestef90/hfdownloader/internal/transfer"
 )
 
@@ -27,6 +28,11 @@ type HubService interface {
 	AuthHeaders() http.Header
 }
 
+// RouterService abstracts Router HTTP operations needed by the TUI.
+type RouterService interface {
+	WaitForPreset(ctx context.Context, alias string, timeout, interval time.Duration) bool
+}
+
 type screen int
 
 const (
@@ -35,7 +41,12 @@ const (
 	screenPicker
 	screenOverwriteConfirm
 	screenDownloading
-	screenDownloaded
+	screenPreparingPreset
+	screenPresetEditor
+	screenCopyDefaults
+	screenPresetOverwriteConfirm
+	screenPresetWriting
+	screenPresetWritten
 )
 
 type repoLoadedMsg struct {
@@ -52,11 +63,26 @@ type downloadFinishedMsg struct {
 	err    error
 }
 
+type presetPreparedMsg struct {
+	draft          preset.Draft
+	existingText   string
+	ctxSourceLabel string
+	err            error
+}
+
+type presetWrittenMsg struct {
+	alias   string
+	result  preset.WriteResult
+	visible bool
+	err     error
+}
+
 // Options configures a new TUI Model.
 type Options struct {
 	Config     config.Config
 	Hub        HubService
 	Target     transfer.Target
+	Router     RouterService
 	HTTPClient *http.Client
 	InitialURL string
 }
@@ -72,6 +98,7 @@ type Model struct {
 	cfg        config.Config
 	hub        HubService
 	target     transfer.Target
+	router     RouterService
 	httpClient *http.Client
 
 	screen  screen
@@ -93,6 +120,13 @@ type Model struct {
 	dlSession  *downloadSession
 	dlProgress transfer.Progress
 	dlResult   transfer.DownloadResult
+
+	editor          presetEditor
+	pendingSaveRaw  string
+	pendingSave     preset.Draft
+	writtenAlias    string
+	writtenResult   preset.WriteResult
+	writtenVisible  bool
 }
 
 // New creates the initial Bubble Tea model.
@@ -113,6 +147,7 @@ func New(opts Options) Model {
 		cfg:        opts.Config,
 		hub:        opts.Hub,
 		target:     opts.Target,
+		router:     opts.Router,
 		httpClient: opts.HTTPClient,
 		screen:     screenURLInput,
 		urlInput:   ti,
@@ -226,6 +261,84 @@ func (m *Model) startDownload(quant hub.Quant, overwrite bool) tea.Cmd {
 	return tea.Batch(m.spin.Tick, waitDownloadEvent(sess))
 }
 
+func (m Model) preparePresetCmd() tea.Cmd {
+	target := m.target
+	presetPath := m.cfg.PresetPath
+	repo := m.repo.Repo
+	quant := m.selectedQuant
+	dlRes := m.dlResult
+
+	return func() tea.Msg {
+		var existingText string
+		if target != nil {
+			txt, _, err := target.ReadText(context.Background(), presetPath)
+			if err != nil {
+				return presetPreparedMsg{err: err}
+			}
+			existingText = txt
+		}
+
+		modelPath := ""
+		if len(dlRes.Files) > 0 {
+			modelPath = dlRes.Files[0].Path
+		}
+
+		var ctxWin *int
+		ctxLabel := ""
+		if quant.ContextLength > 0 {
+			v := quant.ContextLength
+			ctxWin = &v
+			ctxLabel = "Hub metadata"
+		}
+
+		draft, err := preset.CreateDraft(preset.CreateDraftOptions{
+			Repo:               repo,
+			QuantLabel:         quant.Label,
+			ModelPath:          modelPath,
+			ContextWindow:      ctxWin,
+			ExistingPresetText: existingText,
+		})
+		if err != nil {
+			return presetPreparedMsg{err: err}
+		}
+
+		return presetPreparedMsg{
+			draft:          draft,
+			existingText:   existingText,
+			ctxSourceLabel: ctxLabel,
+		}
+	}
+}
+
+func (m Model) writePresetCmd(d preset.Draft, rawText string, overwriteAlias bool) tea.Cmd {
+	target := m.target
+	rtr := m.router
+	presetPath := m.cfg.PresetPath
+
+	return func() tea.Msg {
+		res, err := preset.Write(context.Background(), preset.WriteOptions{
+			Target:         target,
+			PresetPath:     presetPath,
+			Draft:          d,
+			RawText:        rawText,
+			OverwriteAlias: overwriteAlias,
+		})
+		if err != nil {
+			return presetWrittenMsg{alias: d.Alias, err: err}
+		}
+
+		visible := false
+		if rtr != nil {
+			visible = rtr.WaitForPreset(context.Background(), d.Alias, 3*time.Second, 250*time.Millisecond)
+		}
+		return presetWrittenMsg{
+			alias:   d.Alias,
+			result:  res,
+			visible: visible,
+		}
+	}
+}
+
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -245,11 +358,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				pbW = 20
 			}
 			m.progBar.Width = pbW
+			m.editor.setWidth(msg.Width)
 		}
 		return m, nil
 
 	case spinner.TickMsg:
-		if m.screen == screenLoading || m.screen == screenDownloading {
+		if m.screen == screenLoading || m.screen == screenDownloading || m.screen == screenPreparingPreset || m.screen == screenPresetWriting {
 			var cmd tea.Cmd
 			m.spin, cmd = m.spin.Update(msg)
 			return m, cmd
@@ -308,7 +422,40 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.dlResult = msg.result
 		m.errMsg = ""
 		m.status = fmt.Sprintf("Downloaded and verified %d file(s) (%s).", len(msg.result.Files), hub.FormatBytes(msg.result.Bytes))
-		m.screen = screenDownloaded
+		m.screen = screenPreparingPreset
+		return m, tea.Batch(m.spin.Tick, m.preparePresetCmd())
+
+	case presetPreparedMsg:
+		if msg.err != nil {
+			m.errMsg = msg.err.Error()
+			m.screen = screenPicker
+			return m, nil
+		}
+		m.editor = newPresetEditor(msg.draft, msg.existingText, msg.ctxSourceLabel)
+		if m.width > 12 {
+			m.editor.setWidth(m.width)
+		}
+		m.errMsg = ""
+		m.screen = screenPresetEditor
+		return m, textinput.Blink
+
+	case presetWrittenMsg:
+		if msg.err != nil {
+			var existsErr *preset.AliasExistsError
+			if errors.As(msg.err, &existsErr) {
+				m.errMsg = ""
+				m.screen = screenPresetOverwriteConfirm
+				return m, nil
+			}
+			m.errMsg = msg.err.Error()
+			m.screen = screenPresetEditor
+			return m, nil
+		}
+		m.writtenAlias = msg.alias
+		m.writtenResult = msg.result
+		m.writtenVisible = msg.visible
+		m.errMsg = ""
+		m.screen = screenPresetWritten
 		return m, nil
 
 	case tea.KeyMsg:
@@ -321,7 +468,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch m.screen {
 		case screenURLInput:
 			return m.updateURLInput(msg)
-		case screenLoading:
+		case screenLoading, screenPreparingPreset, screenPresetWriting:
 			if msg.String() == "q" || msg.String() == "esc" {
 				return m, tea.Quit
 			}
@@ -338,7 +485,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			return m, nil
-		case screenDownloaded:
+		case screenPresetEditor:
+			return m.updatePresetEditor(msg)
+		case screenCopyDefaults:
+			return m.updateCopyDefaults(msg)
+		case screenPresetOverwriteConfirm:
+			return m.updatePresetOverwriteConfirm(msg)
+		case screenPresetWritten:
 			switch msg.String() {
 			case "q", "esc", "enter":
 				return m, tea.Quit
@@ -419,6 +572,115 @@ func (m Model) updateOverwriteConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.overwritePaths = nil
 		m.status = "Overwrite cancelled."
 		m.screen = screenPicker
+		return m, nil
+	case "q":
+		return m, tea.Quit
+	}
+	return m, nil
+}
+
+func (m Model) updatePresetEditor(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.errMsg = ""
+		m.screen = screenPicker
+		return m, nil
+	case "ctrl+r", "f2":
+		if err := m.editor.toggleRawMode(); err != nil {
+			m.errMsg = err.Error()
+			return m, nil
+		}
+		m.errMsg = ""
+		return m, nil
+	case "ctrl+d":
+		if len(m.editor.existingNames) == 0 {
+			m.errMsg = "No existing Presets in " + m.cfg.PresetPath + " to copy defaults from."
+			return m, nil
+		}
+		m.errMsg = ""
+		m.editor.defaultsCursor = 0
+		m.screen = screenCopyDefaults
+		return m, nil
+	case "ctrl+s":
+		d, raw, err := m.editor.buildForSave()
+		if err != nil {
+			m.errMsg = err.Error()
+			return m, nil
+		}
+		m.pendingSave = d
+		m.pendingSaveRaw = raw
+		m.errMsg = ""
+		m.screen = screenPresetWriting
+		return m, tea.Batch(m.spin.Tick, m.writePresetCmd(d, raw, false))
+	}
+
+	if !m.editor.rawMode {
+		switch msg.String() {
+		case "tab", "down":
+			m.editor.nextField()
+			return m, nil
+		case "shift+tab", "up":
+			m.editor.prevField()
+			return m, nil
+		case "enter":
+			if m.editor.activeField < fieldCount-1 {
+				m.editor.nextField()
+				return m, nil
+			}
+			d, raw, err := m.editor.buildForSave()
+			if err != nil {
+				m.errMsg = err.Error()
+				return m, nil
+			}
+			m.pendingSave = d
+			m.pendingSaveRaw = raw
+			m.errMsg = ""
+			m.screen = screenPresetWriting
+			return m, tea.Batch(m.spin.Tick, m.writePresetCmd(d, raw, false))
+		}
+	}
+
+	cmd := m.editor.updateInput(msg)
+	return m, cmd
+}
+
+func (m Model) updateCopyDefaults(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "q":
+		m.screen = screenPresetEditor
+		return m, nil
+	case "up", "k":
+		if m.editor.defaultsCursor > 0 {
+			m.editor.defaultsCursor--
+		}
+	case "down", "j":
+		if m.editor.defaultsCursor < len(m.editor.existingNames)-1 {
+			m.editor.defaultsCursor++
+		}
+	case "enter":
+		if m.editor.defaultsCursor >= 0 && m.editor.defaultsCursor < len(m.editor.existingNames) {
+			name := m.editor.existingNames[m.editor.defaultsCursor]
+			if err := m.editor.applyCopiedDefaults(name); err != nil {
+				m.errMsg = err.Error()
+			} else {
+				m.errMsg = ""
+				m.status = fmt.Sprintf("Copied defaults from Preset [%s].", name)
+			}
+			m.screen = screenPresetEditor
+			return m, nil
+		}
+	}
+	return m, nil
+}
+
+func (m Model) updatePresetOverwriteConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch strings.ToLower(msg.String()) {
+	case "y":
+		m.screen = screenPresetWriting
+		return m, tea.Batch(m.spin.Tick, m.writePresetCmd(m.pendingSave, m.pendingSaveRaw, true))
+	case "n", "esc":
+		m.screen = screenPresetEditor
+		m.status = "Preset overwrite cancelled."
 		return m, nil
 	case "q":
 		return m, tea.Quit
@@ -586,16 +848,117 @@ func (m Model) View() string {
 		b.WriteString(styleMuted.Render("Esc / c: cancel download and remove partial files"))
 		b.WriteString("\n")
 
-	case screenDownloaded:
-		b.WriteString(styleSuccess.Render("Download complete"))
+	case screenPreparingPreset:
+		b.WriteString(fmt.Sprintf("%s Preparing Preset draft for %s...\n", m.spin.View(), m.selectedQuant.Label))
+
+	case screenPresetEditor:
+		viewLabel := "Structured View"
+		if m.editor.rawMode {
+			viewLabel = "Raw INI View"
+		}
+		b.WriteString(styleSection.Render("Preset Draft"))
+		b.WriteString("  ")
+		b.WriteString(styleBadge.Render(viewLabel))
+		b.WriteString("  ")
+		b.WriteString(styleMuted.Render(m.cfg.PresetPath))
 		b.WriteString("\n\n")
-		for _, f := range m.dlResult.Files {
-			b.WriteString(fmt.Sprintf("  ✓ %s (%s)\n", f.Path, hub.FormatBytes(f.Size)))
+
+		if !m.editor.rawMode {
+			b.WriteString(renderField("Alias", m.editor.aliasInput.View(), m.editor.activeField == fieldAlias))
+			b.WriteString(renderField("Model path", m.editor.modelInput.View(), m.editor.activeField == fieldModelPath))
+			ctxLabel := "Context Window"
+			if m.editor.ctxSourceLabel != "" {
+				ctxLabel += " (" + m.editor.ctxSourceLabel + ")"
+			}
+			b.WriteString(renderField(ctxLabel, m.editor.ctxInput.View(), m.editor.activeField == fieldContextWindow))
+			if len(m.editor.draft.Defaults) > 0 {
+				src := "copied defaults"
+				if m.editor.copiedFrom != "" {
+					src = "copied from [" + m.editor.copiedFrom + "]"
+				}
+				b.WriteString("\n")
+				b.WriteString(styleMuted.Render(fmt.Sprintf("Inherited settings (%s):", src)))
+				b.WriteString("\n")
+				for _, e := range m.editor.draft.Defaults {
+					b.WriteString(fmt.Sprintf("  %s = %s\n", e.Key, e.Value))
+				}
+			}
+		} else {
+			b.WriteString(styleBox.Render(m.editor.rawArea.View()))
+			b.WriteString("\n")
+		}
+
+		if m.errMsg != "" {
+			b.WriteString("\n")
+			b.WriteString(styleError.Render("Error: " + m.errMsg))
+			b.WriteString("\n")
+		}
+		if m.status != "" {
+			b.WriteString("\n")
+			b.WriteString(styleSuccess.Render(m.status))
+			b.WriteString("\n")
+		}
+
+		b.WriteString("\n")
+		if m.editor.rawMode {
+			b.WriteString(styleMuted.Render("Ctrl+R / F2: structured view  •  Ctrl+D: copy defaults  •  Ctrl+S: write Preset  •  Esc: back"))
+		} else {
+			b.WriteString(styleMuted.Render("Tab/↑/↓: field  •  Ctrl+R / F2: raw INI view  •  Ctrl+D: copy defaults  •  Ctrl+S: write Preset  •  Esc: back"))
 		}
 		b.WriteString("\n")
+
+	case screenCopyDefaults:
+		b.WriteString(styleSection.Render("Copy Defaults from Existing Preset"))
+		b.WriteString("\n\n")
+		for i, name := range m.editor.existingNames {
+			if i == m.editor.defaultsCursor {
+				b.WriteString(styleSelected.Render("▸ [" + name + "]"))
+			} else {
+				b.WriteString("  [" + name + "]")
+			}
+			b.WriteString("\n")
+		}
+		b.WriteString("\n")
+		b.WriteString(styleMuted.Render("↑/↓: move  •  Enter: copy defaults  •  Esc: cancel"))
+		b.WriteString("\n")
+
+	case screenPresetOverwriteConfirm:
+		b.WriteString(styleWarning.Render(fmt.Sprintf("Preset [%s] already exists in %s.", m.pendingSave.Alias, m.cfg.PresetPath)))
+		b.WriteString("\n\n")
+		b.WriteString("Overwrite this Preset (a timestamped backup will be created first)? ")
+		b.WriteString(styleSelected.Render("[y] Overwrite"))
+		b.WriteString("  ")
+		b.WriteString(styleMuted.Render("[n / Esc] Cancel"))
+		b.WriteString("\n")
+
+	case screenPresetWriting:
+		b.WriteString(fmt.Sprintf("%s Writing Preset [%s] and checking Router visibility...\n", m.spin.View(), m.pendingSave.Alias))
+
+	case screenPresetWritten:
+		b.WriteString(styleSuccess.Render(fmt.Sprintf("Preset [%s] written to %s", m.writtenAlias, m.cfg.PresetPath)))
+		b.WriteString("\n\n")
+		if m.writtenResult.BackupPath != "" {
+			b.WriteString(fmt.Sprintf("Backup created: %s\n", m.writtenResult.BackupPath))
+		}
+		if m.writtenVisible {
+			b.WriteString(styleSuccess.Render("Router status: Preset is visible on the Router (no model loaded)."))
+		} else {
+			b.WriteString(styleWarning.Render("Router status: Preset not yet visible on the Router — restart the Router to reload Presets (no model loaded)."))
+		}
+		b.WriteString("\n\n")
 		b.WriteString(styleMuted.Render("b: back to Quant picker  •  Enter / q: quit"))
 		b.WriteString("\n")
 	}
 
 	return b.String()
+}
+
+func renderField(label, inputView string, active bool) string {
+	prefix := "  "
+	lbl := styleMuted.Render(label + ":")
+	if active {
+		prefix = styleSelected.Render("▸ ")
+		lbl = styleSelected.Render(label + ":")
+	}
+	return fmt.Sprintf("%s%s\n  %s\n", prefix, lbl, inputView)
 }

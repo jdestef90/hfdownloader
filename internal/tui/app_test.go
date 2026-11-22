@@ -3,13 +3,17 @@ package tui
 import (
 	"context"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/jdestef90/hfdownloader/internal/config"
 	"github.com/jdestef90/hfdownloader/internal/hub"
+	"github.com/jdestef90/hfdownloader/internal/preset"
 	"github.com/jdestef90/hfdownloader/internal/transfer"
 )
 
@@ -33,6 +37,16 @@ func (f *fakeHub) ResolveURL(repo, filePath, revision string) string {
 
 func (f *fakeHub) AuthHeaders() http.Header {
 	return make(http.Header)
+}
+
+type fakeRouter struct {
+	visible bool
+	waited  []string
+}
+
+func (f *fakeRouter) WaitForPreset(_ context.Context, alias string, _, _ time.Duration) bool {
+	f.waited = append(f.waited, alias)
+	return f.visible
 }
 
 func sampleConfig() config.Config {
@@ -59,16 +73,18 @@ func sampleRepoInfo() hub.RepoInfo {
 		},
 		Quants: []hub.Quant{
 			{
-				Label: "Q4_K_M",
-				Size:  4 * 1024 * 1024 * 1024,
+				Label:         "Q4_K_M",
+				Size:          4 * 1024 * 1024 * 1024,
+				ContextLength: 40960,
 				Files: []hub.File{
 					{Path: "Qwen3-Q4_K_M-00001-of-00002.gguf", Size: 2 * 1024 * 1024 * 1024, Shard: &hub.Shard{Index: 1, Total: 2}},
 					{Path: "Qwen3-Q4_K_M-00002-of-00002.gguf", Size: 2 * 1024 * 1024 * 1024, Shard: &hub.Shard{Index: 2, Total: 2}},
 				},
 			},
 			{
-				Label: "Q8_0",
-				Size:  8 * 1024 * 1024 * 1024,
+				Label:         "Q8_0",
+				Size:          8 * 1024 * 1024 * 1024,
+				ContextLength: 40960,
 				Files: []hub.File{
 					{Path: "Qwen3-Q8_0.gguf", Size: 8 * 1024 * 1024 * 1024},
 				},
@@ -145,7 +161,6 @@ func TestDownloadOverwriteConfirmationAndChecksumErrorHandling(t *testing.T) {
 	m.repo = sampleRepoInfo()
 	m.screen = screenDownloading
 
-	// OverwriteRequiredError routes to overwrite confirmation screen.
 	updated, _ := m.Update(downloadFinishedMsg{
 		err: &transfer.OverwriteRequiredError{Paths: []string{"/srv/gguf/Qwen3-Q8_0.gguf"}},
 	})
@@ -157,23 +172,107 @@ func TestDownloadOverwriteConfirmationAndChecksumErrorHandling(t *testing.T) {
 		t.Fatalf("expected overwrite path in view, got:\n%s", owModel.View())
 	}
 
-	// Declining overwrite returns to picker.
 	updated, _ = owModel.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
 	back := updated.(Model)
 	if back.screen != screenPicker {
 		t.Fatalf("expected return to picker on n, got %v", back.screen)
 	}
 
-	// ChecksumError blocks completion and shows error on picker.
 	back.screen = screenDownloading
 	updated, _ = back.Update(downloadFinishedMsg{
 		err: &transfer.ChecksumError{Path: "/srv/gguf/Qwen3-Q8_0.gguf", Expected: "aaa", Actual: "bbb"},
 	})
 	errModel := updated.(Model)
 	if errModel.screen != screenPicker {
-		t.Fatalf("expected checksum error to return to picker (blocking Preset creation), got %v", errModel.screen)
+		t.Fatalf("expected checksum error to return to picker, got %v", errModel.screen)
 	}
 	if !strings.Contains(errModel.View(), "SHA-256 mismatch") {
 		t.Fatalf("expected SHA-256 mismatch message in view, got:\n%s", errModel.View())
+	}
+}
+
+func TestPresetEditorStructuredRawSyncCopyDefaultsAndWrite(t *testing.T) {
+	dir := t.TempDir()
+	presetPath := filepath.Join(dir, "presets.ini")
+	existing := "[base-preset]\nmodel = /srv/gguf/old.gguf\nflash-attn = on\nn-gpu-layers = 99\n"
+	if err := os.WriteFile(presetPath, []byte(existing), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := sampleConfig()
+	cfg.Mode = config.ModeLocal
+	cfg.PresetPath = presetPath
+
+	rtr := &fakeRouter{visible: true}
+	m := New(Options{
+		Config: cfg,
+		Hub:    &fakeHub{info: sampleRepoInfo()},
+		Target: transfer.NewLocalTarget(),
+		Router: rtr,
+	})
+	m.repo = sampleRepoInfo()
+	m.selectedQuant = m.repo.Quants[0]
+	m.dlResult = transfer.DownloadResult{
+		Files: []transfer.DownloadedFile{{Path: "/srv/gguf/Qwen3-Q4_K_M-00001-of-00002.gguf", Size: 100}},
+		Bytes: 100,
+	}
+
+	// Prepare Preset draft after download.
+	prepMsg := m.preparePresetCmd()()
+	updated, _ := m.Update(prepMsg)
+	ed := updated.(Model)
+	if ed.screen != screenPresetEditor {
+		t.Fatalf("expected screenPresetEditor, got %v", ed.screen)
+	}
+	if ed.editor.aliasInput.Value() != "Qwen3-Q4_K_M" {
+		t.Fatalf("expected prefilled alias Qwen3-Q4_K_M, got %q", ed.editor.aliasInput.Value())
+	}
+
+	// Copy defaults from [base-preset].
+	updated, _ = ed.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
+	cp := updated.(Model)
+	if cp.screen != screenCopyDefaults {
+		t.Fatalf("expected screenCopyDefaults, got %v", cp.screen)
+	}
+	updated, _ = cp.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	ed = updated.(Model)
+	if ed.screen != screenPresetEditor || len(ed.editor.draft.Defaults) != 2 {
+		t.Fatalf("expected 2 copied defaults, got screen=%v defaults=%+v", ed.screen, ed.editor.draft.Defaults)
+	}
+
+	// Switch to raw INI view, edit ctx-size, switch back to structured view, verify sync.
+	updated, _ = ed.Update(tea.KeyMsg{Type: tea.KeyCtrlR})
+	ed = updated.(Model)
+	if !ed.editor.rawMode {
+		t.Fatal("expected rawMode=true after Ctrl+R")
+	}
+	ed.editor.rawArea.SetValue(strings.Replace(ed.editor.rawArea.Value(), "ctx-size = 40960", "ctx-size = 32768", 1))
+	updated, _ = ed.Update(tea.KeyMsg{Type: tea.KeyCtrlR})
+	ed = updated.(Model)
+	if ed.editor.rawMode || ed.editor.ctxInput.Value() != "32768" {
+		t.Fatalf("expected synced structured ctx-size 32768, got rawMode=%v val=%q", ed.editor.rawMode, ed.editor.ctxInput.Value())
+	}
+
+	// Save Preset and verify backup + Router visibility.
+	d, raw, err := ed.editor.buildForSave()
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeMsg := ed.writePresetCmd(d, raw, false)()
+	updated, _ = ed.Update(writeMsg)
+	done := updated.(Model)
+	if done.screen != screenPresetWritten {
+		t.Fatalf("expected screenPresetWritten, got %v (err=%q)", done.screen, done.errMsg)
+	}
+	if !done.writtenVisible || done.writtenResult.BackupPath == "" {
+		t.Fatalf("expected visible Preset with backup, got visible=%v backup=%q", done.writtenVisible, done.writtenResult.BackupPath)
+	}
+
+	// Attempting to overwrite same alias without confirmation routes to screenPresetOverwriteConfirm.
+	writeAgain := done.writePresetCmd(preset.Draft{Alias: "Qwen3-Q4_K_M", ModelPath: "/srv/gguf/x.gguf"}, "", false)()
+	updated, _ = done.Update(writeAgain)
+	ow := updated.(Model)
+	if ow.screen != screenPresetOverwriteConfirm {
+		t.Fatalf("expected screenPresetOverwriteConfirm on duplicate alias, got %v", ow.screen)
 	}
 }
