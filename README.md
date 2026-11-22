@@ -60,9 +60,11 @@ Do not commit real tokens. Keep the config outside the repository, or use the en
 ## Development
 
 ```sh
-go test ./...
+go test -race ./...
 go vet ./...
 go build -ldflags="-s -w" -o bin/hfdownloader ./cmd/hfdownloader
+go run ./cmd/demo --scripted   # non-interactive end-to-end walkthrough against a fake Hub and Router
+go run ./cmd/demo              # interactive Bubble Tea demo against a fake Hub and Router
 ```
 
 ## Design notes

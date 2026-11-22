@@ -49,6 +49,8 @@ const (
 	screenPresetOverwriteConfirm
 	screenPresetWriting
 	screenPresetWritten
+	screenRestarting
+	screenDone
 )
 
 type repoLoadedMsg struct {
@@ -75,6 +77,12 @@ type presetPreparedMsg struct {
 type presetWrittenMsg struct {
 	alias   string
 	result  preset.WriteResult
+	visible bool
+	err     error
+}
+
+type restartFinishedMsg struct {
+	result  transfer.CommandResult
 	visible bool
 	err     error
 }
@@ -133,6 +141,9 @@ type Model struct {
 	writtenAlias    string
 	writtenResult   preset.WriteResult
 	writtenVisible  bool
+	restartRan      bool
+	restartResult   transfer.CommandResult
+	restartErr      string
 }
 
 // New creates the initial Bubble Tea model.
@@ -396,6 +407,31 @@ func (m Model) writePresetCmd(d preset.Draft, rawText string, overwriteAlias boo
 	}
 }
 
+func (m Model) runRestartCmd() tea.Cmd {
+	target := m.target
+	rtr := m.router
+	cmdStr := m.cfg.RestartCommand
+	alias := m.writtenAlias
+
+	return func() tea.Msg {
+		if target == nil {
+			return restartFinishedMsg{err: errors.New("no target configured for restart command")}
+		}
+		res, err := target.Run(context.Background(), cmdStr)
+		if err != nil {
+			return restartFinishedMsg{result: res, err: err}
+		}
+		visible := false
+		if res.ExitCode == 0 && rtr != nil {
+			visible = rtr.WaitForPreset(context.Background(), alias, 3*time.Second, 250*time.Millisecond)
+		}
+		return restartFinishedMsg{
+			result:  res,
+			visible: visible,
+		}
+	}
+}
+
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -420,7 +456,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case spinner.TickMsg:
-		if m.screen == screenLoading || m.screen == screenDownloading || m.screen == screenPreparingPreset || m.screen == screenPresetWriting {
+		if m.screen == screenLoading || m.screen == screenDownloading || m.screen == screenPreparingPreset || m.screen == screenPresetWriting || m.screen == screenRestarting {
 			var cmd tea.Cmd
 			m.spin, cmd = m.spin.Update(msg)
 			return m, cmd
@@ -514,8 +550,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.writtenAlias = msg.alias
 		m.writtenResult = msg.result
 		m.writtenVisible = msg.visible
+		m.restartRan = false
+		m.restartErr = ""
+		m.restartResult = transfer.CommandResult{}
 		m.errMsg = ""
 		m.screen = screenPresetWritten
+		return m, nil
+
+	case restartFinishedMsg:
+		m.restartRan = true
+		m.restartResult = msg.result
+		if msg.err != nil {
+			m.restartErr = msg.err.Error()
+		} else if msg.result.ExitCode != 0 {
+			m.restartErr = fmt.Sprintf("restart command exited with status %d", msg.result.ExitCode)
+		} else {
+			m.restartErr = ""
+			m.writtenVisible = msg.visible || m.writtenVisible
+		}
+		m.screen = screenDone
 		return m, nil
 
 	case tea.KeyMsg:
@@ -528,7 +581,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch m.screen {
 		case screenURLInput:
 			return m.updateURLInput(msg)
-		case screenLoading, screenPreparingPreset, screenPresetWriting:
+		case screenLoading, screenPreparingPreset, screenPresetWriting, screenRestarting:
 			if msg.String() == "q" || msg.String() == "esc" {
 				return m, tea.Quit
 			}
@@ -552,6 +605,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case screenPresetOverwriteConfirm:
 			return m.updatePresetOverwriteConfirm(msg)
 		case screenPresetWritten:
+			switch strings.ToLower(msg.String()) {
+			case "y":
+				m.screen = screenRestarting
+				return m, tea.Batch(m.spin.Tick, m.runRestartCmd())
+			case "n", "s":
+				m.restartRan = false
+				m.screen = screenDone
+				return m, nil
+			case "b":
+				m.screen = screenPicker
+				return m, nil
+			case "q", "esc":
+				return m, tea.Quit
+			}
+			return m, nil
+		case screenDone:
 			switch msg.String() {
 			case "q", "esc", "enter":
 				return m, tea.Quit
@@ -1077,7 +1146,56 @@ func (m Model) View() string {
 		if m.writtenVisible {
 			b.WriteString(styleSuccess.Render("Router status: Preset is visible on the Router (no model loaded)."))
 		} else {
-			b.WriteString(styleWarning.Render("Router status: Preset not yet visible on the Router — restart the Router to reload Presets (no model loaded)."))
+			b.WriteString(styleWarning.Render("Router status: Preset written; restart the Router so INI changes take effect."))
+		}
+		b.WriteString("\n\n")
+		conn := string(m.cfg.Mode)
+		if m.target != nil {
+			conn = m.target.Description()
+		}
+		b.WriteString(styleSection.Render(fmt.Sprintf("Confirm Router Restart (%s)", conn)))
+		b.WriteString("\n")
+		b.WriteString(styleBox.Render(m.cfg.RestartCommand))
+		b.WriteString("\n\n")
+		b.WriteString("Run this restart command now? ")
+		b.WriteString(styleSelected.Render("[y] Confirm & Restart"))
+		b.WriteString("  ")
+		b.WriteString(styleMuted.Render("[n] Skip restart  •  [q] Quit"))
+		b.WriteString("\n")
+
+	case screenRestarting:
+		conn := string(m.cfg.Mode)
+		if m.target != nil {
+			conn = m.target.Description()
+		}
+		b.WriteString(fmt.Sprintf("%s Running restart command over %s...\n\n", m.spin.View(), conn))
+		b.WriteString(styleBox.Render(m.cfg.RestartCommand))
+		b.WriteString("\n")
+
+	case screenDone:
+		if m.restartRan {
+			if m.restartErr != "" {
+				b.WriteString(styleError.Render("Restart failed: " + m.restartErr))
+				b.WriteString("\n")
+			} else {
+				b.WriteString(styleSuccess.Render("Router restart command succeeded (no model loaded automatically)."))
+				b.WriteString("\n")
+			}
+			if out := strings.TrimSpace(m.restartResult.Stdout); out != "" {
+				b.WriteString("\n" + styleMuted.Render("stdout:") + "\n" + out + "\n")
+			}
+			if errOut := strings.TrimSpace(m.restartResult.Stderr); errOut != "" {
+				b.WriteString("\n" + styleMuted.Render("stderr:") + "\n" + errOut + "\n")
+			}
+		} else {
+			b.WriteString(styleWarning.Render("Router restart skipped (no model loaded automatically)."))
+			b.WriteString("\n")
+		}
+		b.WriteString("\n")
+		if m.writtenVisible {
+			b.WriteString(styleSuccess.Render(fmt.Sprintf("Preset [%s] is visible on the Router.", m.writtenAlias)))
+		} else {
+			b.WriteString(styleMuted.Render(fmt.Sprintf("Preset [%s] saved in %s.", m.writtenAlias, m.cfg.PresetPath)))
 		}
 		b.WriteString("\n\n")
 		b.WriteString(styleMuted.Render("b: back to Quant picker  •  Enter / q: quit"))
