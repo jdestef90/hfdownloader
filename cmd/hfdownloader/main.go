@@ -10,6 +10,7 @@ import (
 
 	"github.com/jdestef90/hfdownloader/internal/config"
 	"github.com/jdestef90/hfdownloader/internal/hub"
+	"github.com/jdestef90/hfdownloader/internal/transfer"
 	"github.com/jdestef90/hfdownloader/internal/tui"
 )
 
@@ -63,9 +64,15 @@ func run(args []string, stdout, stderr io.Writer) int {
 		Token:   cfg.HubToken,
 	})
 
+	var target transfer.Target
+	if cfg.Mode == config.ModeSSH {
+		target = transfer.NewSSHTarget(cfg.SSHTarget, os.Getenv("HFDOWNLOADER_SSH_BIN"))
+	}
+
 	model := tui.New(tui.Options{
 		Config:     cfg,
 		Hub:        hubClient,
+		Target:     target,
 		InitialURL: initialURL,
 	})
 

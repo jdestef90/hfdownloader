@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -9,20 +10,29 @@ import (
 
 	"github.com/jdestef90/hfdownloader/internal/config"
 	"github.com/jdestef90/hfdownloader/internal/hub"
+	"github.com/jdestef90/hfdownloader/internal/transfer"
 )
 
-type fakeBrowser struct {
+type fakeHub struct {
 	info  hub.RepoInfo
 	err   error
 	calls []string
 }
 
-func (f *fakeBrowser) ListQuants(_ context.Context, repo, revision string) (hub.RepoInfo, error) {
+func (f *fakeHub) ListQuants(_ context.Context, repo, revision string) (hub.RepoInfo, error) {
 	f.calls = append(f.calls, repo+"@"+revision)
 	if f.err != nil {
 		return hub.RepoInfo{}, f.err
 	}
 	return f.info, nil
+}
+
+func (f *fakeHub) ResolveURL(repo, filePath, revision string) string {
+	return "https://huggingface.co/" + repo + "/resolve/" + revision + "/" + filePath
+}
+
+func (f *fakeHub) AuthHeaders() http.Header {
+	return make(http.Header)
 }
 
 func sampleConfig() config.Config {
@@ -70,11 +80,9 @@ func sampleRepoInfo() hub.RepoInfo {
 func TestCLIURLAndInteractivePasteProduceIdenticalPicker(t *testing.T) {
 	info := sampleRepoInfo()
 
-	// Path 1: launched with CLI URL argument.
-	cliBrowser := &fakeBrowser{info: info}
 	cliModel := New(Options{
 		Config:     sampleConfig(),
-		Hub:        cliBrowser,
+		Hub:        &fakeHub{info: info},
 		InitialURL: "https://huggingface.co/unsloth/Qwen3-GGUF",
 	})
 	if cliModel.screen != screenLoading {
@@ -84,11 +92,9 @@ func TestCLIURLAndInteractivePasteProduceIdenticalPicker(t *testing.T) {
 	updated, _ := cliModel.Update(loadedMsg)
 	cliPicker := updated.(Model)
 
-	// Path 2: bare launch with pasted URL.
-	pasteBrowser := &fakeBrowser{info: info}
 	pasteModel := New(Options{
 		Config: sampleConfig(),
-		Hub:    pasteBrowser,
+		Hub:    &fakeHub{info: info},
 	})
 	if pasteModel.screen != screenURLInput {
 		t.Fatalf("expected screenURLInput on bare launch, got %v", pasteModel.screen)
@@ -118,7 +124,7 @@ func TestCLIURLAndInteractivePasteProduceIdenticalPicker(t *testing.T) {
 func TestInvalidURLShowsErrorInPasteField(t *testing.T) {
 	m := New(Options{
 		Config: sampleConfig(),
-		Hub:    &fakeBrowser{},
+		Hub:    &fakeHub{},
 	})
 	m.urlInput.SetValue("https://example.com/not-hf/repo")
 	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
@@ -128,5 +134,46 @@ func TestInvalidURLShowsErrorInPasteField(t *testing.T) {
 	}
 	if !strings.Contains(got.View(), "huggingface.co") {
 		t.Fatalf("expected huggingface.co validation error, got:\n%s", got.View())
+	}
+}
+
+func TestDownloadOverwriteConfirmationAndChecksumErrorHandling(t *testing.T) {
+	m := New(Options{
+		Config: sampleConfig(),
+		Hub:    &fakeHub{info: sampleRepoInfo()},
+	})
+	m.repo = sampleRepoInfo()
+	m.screen = screenDownloading
+
+	// OverwriteRequiredError routes to overwrite confirmation screen.
+	updated, _ := m.Update(downloadFinishedMsg{
+		err: &transfer.OverwriteRequiredError{Paths: []string{"/srv/gguf/Qwen3-Q8_0.gguf"}},
+	})
+	owModel := updated.(Model)
+	if owModel.screen != screenOverwriteConfirm {
+		t.Fatalf("expected screenOverwriteConfirm, got %v", owModel.screen)
+	}
+	if !strings.Contains(owModel.View(), "/srv/gguf/Qwen3-Q8_0.gguf") {
+		t.Fatalf("expected overwrite path in view, got:\n%s", owModel.View())
+	}
+
+	// Declining overwrite returns to picker.
+	updated, _ = owModel.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	back := updated.(Model)
+	if back.screen != screenPicker {
+		t.Fatalf("expected return to picker on n, got %v", back.screen)
+	}
+
+	// ChecksumError blocks completion and shows error on picker.
+	back.screen = screenDownloading
+	updated, _ = back.Update(downloadFinishedMsg{
+		err: &transfer.ChecksumError{Path: "/srv/gguf/Qwen3-Q8_0.gguf", Expected: "aaa", Actual: "bbb"},
+	})
+	errModel := updated.(Model)
+	if errModel.screen != screenPicker {
+		t.Fatalf("expected checksum error to return to picker (blocking Preset creation), got %v", errModel.screen)
+	}
+	if !strings.Contains(errModel.View(), "SHA-256 mismatch") {
+		t.Fatalf("expected SHA-256 mismatch message in view, got:\n%s", errModel.View())
 	}
 }
